@@ -13011,6 +13011,9 @@
           },
           "updatingMemory": {
             "label": "メモリを更新中..."
+          },
+          "working": {
+            "label": "作業中"
           }
         },
         "internalSearch": {
