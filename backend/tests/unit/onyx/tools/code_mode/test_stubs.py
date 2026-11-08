@@ -206,6 +206,85 @@ def test_strict_nullable_required_arguments_are_optional_and_sent_as_null() -> N
     }
 
 
+def test_null_admitted_through_enum_const_or_ref_is_sent() -> None:
+    parameters: dict[str, JsonValue] = {
+        "type": "object",
+        "$defs": {"MaybeInt": {"anyOf": [{"type": "integer"}, {"type": "null"}]}},
+        "properties": {
+            "mode": {"enum": ["a", None]},
+            "unset": {"const": None},
+            "count": {"$ref": "#/$defs/MaybeInt"},
+            "label": {"enum": ["x", "y"]},
+        },
+        "required": ["mode", "unset", "count"],
+    }
+    function = build_tool_stubs(
+        [FakeTool("update", _unused, parameters=parameters)]
+    ).functions["update"]
+    assert function.nullable_arguments == {"mode", "unset", "count"}
+    assert tool_arguments(function, {"mode": None, "label": None}) == {
+        "mode": None,
+        "unset": None,
+        "count": None,
+    }
+
+
+def test_additional_properties_admit_other_keyword_arguments() -> None:
+    open_map = FakeTool(
+        "tag",
+        _unused,
+        parameters={"type": "object", "additionalProperties": {"type": "string"}},
+    )
+    mixed = FakeTool(
+        "label",
+        _unused,
+        parameters={
+            "type": "object",
+            "properties": {"kwargs": {"type": "integer"}},
+            "required": ["kwargs"],
+            "additionalProperties": True,
+        },
+    )
+    functions = build_tool_stubs([open_map, mixed]).functions
+    assert "async def tag(**kwargs: str) -> Any:" in functions["tag"].stub
+    assert "async def label(*, kwargs: int, **kwargs_: Any) -> Any:" in (
+        functions["label"].stub
+    )
+    assert tool_arguments(functions["tag"], {"team": "core"}) == {"team": "core"}
+
+
+def test_argument_names_are_python_identifiers_in_normal_form() -> None:
+    parameters: dict[str, JsonValue] = {
+        "type": "object",
+        "properties": {"version²": {"type": "string"}, "ﬁle": {"type": "string"}},
+    }
+    function = build_tool_stubs(
+        [FakeTool("fetch", _unused, parameters=parameters)]
+    ).functions["fetch"]
+    assert function.argument_names == {"file": "ﬁle", "version2": "version²"}
+    ast.parse(function.stub)
+
+
+def test_required_entries_that_are_not_names_are_ignored() -> None:
+    tool = FakeMCPTool(
+        "list-tickets",
+        _unused,
+        {
+            "type": "object",
+            "properties": {"filter": {"type": "object", "required": [{}]}},
+            "required": [[], "filter"],
+        },
+        output_schema={
+            "type": "object",
+            "properties": {"tickets": {"type": "array"}},
+            "required": [[]],
+        },
+    )
+    function = build_tool_stubs([tool]).functions["acme__list_tickets"]
+    assert function.required_arguments == {"filter"}
+    assert "tickets: NotRequired[list[Any]]" in "\n".join(function.declarations)
+
+
 def test_recursive_refs_are_bounded() -> None:
     root: dict[str, JsonValue] = {
         "$defs": {"Tree": {"type": "array", "items": {"$ref": "#/$defs/Tree"}}}

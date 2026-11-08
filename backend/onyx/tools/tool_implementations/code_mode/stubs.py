@@ -4,6 +4,7 @@ import builtins
 import json
 import keyword
 import re
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from types import UnionType
 from typing import Literal, Union, cast, get_args, get_origin
@@ -77,8 +78,6 @@ _RESERVED_FUNCTION_NAMES: frozenset[str] = frozenset(
     }
 )
 
-_IDENTIFIER_INVALID = re.compile(r"\W")
-
 
 class ToolFunction(BaseModel):
     """One tool as a Python function inside the sandbox. It stays here, not in
@@ -122,8 +121,14 @@ def python_identifier(
     name: str, *, fallback: str, reserved: frozenset[str], suffix: str
 ) -> str:
     """Map a name to a Python identifier; `suffix` is appended to reserved names."""
-    identifier = _IDENTIFIER_INVALID.sub("_", name.strip()) or fallback
-    if identifier[0].isdigit():
+    # Python reads identifiers in NFKC form, so a program's keyword names arrive
+    # normalized; keep only characters that are valid in that form.
+    normalized = unicodedata.normalize("NFKC", name.strip())
+    identifier = (
+        "".join(char if f"_{char}".isidentifier() else "_" for char in normalized)
+        or fallback
+    )
+    if not identifier.isidentifier():
         identifier = f"{fallback}_{identifier}"
     return f"{identifier}{suffix}" if identifier in reserved else identifier
 
@@ -328,44 +333,79 @@ def _object_keys_summary(schema: JsonValue) -> str:
     properties = schema.get("properties")
     if not isinstance(properties, dict) or not properties:
         return ""
-    required = schema.get("required")
-    required_names = set(required) if isinstance(required, list) else set()
+    required_names = _required_names(schema)
     keys = [
         f"{name}{'' if name in required_names else '?'}" for name in sorted(properties)
     ]
     return f" Keys: {', '.join(keys)}."
 
 
-def _admits_null(schema: JsonValue) -> bool:
-    """Whether a JSON schema accepts null."""
+def _required_names(schema: Mapping[str, JsonValue]) -> set[str]:
+    """The property names that `schema` requires; entries that are not str are
+    ignored."""
+    required = schema.get("required")
+    if not isinstance(required, list):
+        return set()
+    return {name for name in required if isinstance(name, str)}
+
+
+def _admits_null(
+    schema: JsonValue, root: Mapping[str, JsonValue], seen: set[str] | None = None
+) -> bool:
+    """Whether a JSON schema accepts null, by the rules that schema_annotation
+    follows. `seen` holds the references already followed; a reference is
+    followed once, which also ends cycles."""
     if not isinstance(schema, dict):
         return False
-    if schema.get("nullable") is True or schema.get("type") == "null":
-        return True
+    seen = seen if seen is not None else set()
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        if ref in seen:
+            return False
+        seen.add(ref)
+        return _admits_null(_resolve_ref(ref, root), root, seen)
     types = schema.get("type")
-    if isinstance(types, list) and "null" in types:
-        return True
-    return any(
-        isinstance(options, list) and any(_admits_null(option) for option in options)
-        for options in (schema.get("anyOf"), schema.get("oneOf"))
+    enum = schema.get("enum")
+    all_of = schema.get("allOf")
+    return (
+        schema.get("nullable") is True
+        or types == "null"
+        or (isinstance(types, list) and "null" in types)
+        or ("const" in schema and schema["const"] is None)
+        or (isinstance(enum, list) and None in enum)
+        or any(
+            isinstance(options, list)
+            and any(_admits_null(option, root, seen) for option in options)
+            for options in (schema.get("anyOf"), schema.get("oneOf"))
+        )
+        # One member renders exactly; an intersection renders as Any.
+        or (
+            isinstance(all_of, list)
+            and len(all_of) == 1
+            and _admits_null(all_of[0], root, seen)
+        )
     )
 
 
 def _parameters(
     parameters: Mapping[str, JsonValue], *, typed: bool
-) -> tuple[list[StubParameter], dict[str, str]]:
+) -> tuple[list[StubParameter], dict[str, str], str | None]:
+    """The named arguments, their Python names mapped to the tool's names, and
+    the annotation of the other keyword arguments that the schema admits
+    through `additionalProperties`, or None when it admits none."""
+    budget = SchemaRefBudget()
+    additional = parameters.get("additionalProperties")
+    extra = (
+        (schema_annotation(additional, parameters, budget=budget) if typed else ANY)
+        if additional is True or isinstance(additional, dict)
+        else None
+    )
     properties = parameters.get("properties")
     if not isinstance(properties, dict):
-        return [], {}
-    required_field = parameters.get("required")
+        return [], {}, extra
     # OpenAPI-derived schemas omit `required`; every argument is then optional.
-    required = (
-        {name for name in required_field if isinstance(name, str)}
-        if isinstance(required_field, list)
-        else set()
-    )
+    required = _required_names(parameters)
     names = unique_identifiers(properties, str, argument_name)
-    budget = SchemaRefBudget()
     result: list[StubParameter] = []
     for python_name, original in names.items():
         prop = properties[original]
@@ -385,13 +425,13 @@ def _parameters(
                 annotation=annotation,
                 required=original in required,
                 # Strict schemas list optional arguments as required and nullable.
-                nullable=_admits_null(prop),
+                nullable=_admits_null(prop, parameters),
                 description=_clip(description, MAX_ARGUMENT_DESCRIPTION_CHARS),
             )
         )
     # Arguments without a default first, each group in name order.
     result.sort(key=lambda parameter: (parameter.has_default, parameter.python_name))
-    return result, names
+    return result, names, extra
 
 
 def _render_function(
@@ -403,20 +443,25 @@ def _render_function(
     tool_name: str,
     returns: str | None = None,
     usage: str | None = None,
-    open_signature: bool = False,
+    extra: str | None = None,
 ) -> str:
-    if open_signature:
-        signature = "**kwargs: Any"
-    elif parameters:
-        rendered = [
-            f"{p.python_name}: {_union([p.annotation, 'None'])} = None"
-            if p.has_default
-            else f"{p.python_name}: {p.annotation}"
-            for p in parameters
-        ]
-        signature = "*, " + ", ".join(rendered)
-    else:
-        signature = ""
+    """`extra` annotates the keyword arguments beyond `parameters`; None admits
+    none."""
+    rendered = [
+        f"{p.python_name}: {_union([p.annotation, 'None'])} = None"
+        if p.has_default
+        else f"{p.python_name}: {p.annotation}"
+        for p in parameters
+    ]
+    if rendered:
+        rendered.insert(0, "*")
+    if extra is not None:
+        taken = {p.python_name for p in parameters}
+        kwargs_name = "kwargs"
+        while kwargs_name in taken:
+            kwargs_name += "_"
+        rendered.append(f"**{kwargs_name}: {extra}")
+    signature = ", ".join(rendered)
     doc_lines = [description or "No description."]
     if tool_name != function_name:
         doc_lines.append(f"Tool name: {tool_name}")
@@ -533,8 +578,7 @@ def _schema_result_type(
         return StubResultType(
             annotation=schema_annotation(schema, schema), declarations=()
         )
-    required_field = schema.get("required")
-    required = set(required_field) if isinstance(required_field, list) else set()
+    required = _required_names(schema)
     type_name = _type_name(function_name, taken)
     budget = SchemaRefBudget()
     fields = []
@@ -572,7 +616,7 @@ def tool_function(
         (False, False, any_result),
         (False, True, any_result),
     ):
-        parameters, names = _parameters(definition.parameters, typed=typed)
+        parameters, names, extra = _parameters(definition.parameters, typed=typed)
         stub = _render_function(
             function_name,
             description,
@@ -581,7 +625,7 @@ def tool_function(
             tool_name=tool.name,
             returns=spec.returns,
             usage=spec.usage,
-            open_signature=open_signature,
+            extra=ANY if open_signature else extra,
         )
         if len(stub) + sum(len(text) for text in result.declarations) <= MAX_STUB_CHARS:
             break
