@@ -503,9 +503,8 @@ def test_closing_record_lists_what_ran_after_the_last_observation() -> None:
     assert closing.commit is not None and closing.commit.writes == {"done": True}
     assert amended.content.startswith(first.content)
     assert amended.content.endswith(
-        "Cell 1 completed after this output, before the response ended. Calls after "
-        "this output: [0] echo: ok. Completed calls may have had effects. "
-        "Stored: done."
+        "Cell 1 completed after this output, before the response ended.\n\n"
+        "Output:\nafter\n\nStored: done."
     )
     # The closing record commits for later turns.
     later = Response(
@@ -535,8 +534,23 @@ def test_closing_record_lists_earlier_calls_of_a_stopped_program() -> None:
     response.run("await echo(value='x')\nyield_control()\nwhile True:\n    pass\n")
     amended = response.finish()["call_1"]
     assert amended.content.endswith(
-        "Cell 1 stopped when the response ended. Calls before this output: "
-        "[0] echo: ok. It made no calls after this output."
+        "Cell 1 stopped when the response ended.\n\nTool calls:\n[0] echo: ok\n"
+        "All of these calls may have had effects, also unfinished calls. Check "
+        "before you retry."
+    )
+
+
+def test_closing_record_reports_output_result_and_store_without_calls() -> None:
+    response = Response()
+    response.run("yield_control()\nprint('late')\nstore('k', 1)\n{'total': 3}\n")
+    until(lambda: response.ended(1))
+    amended = response.finish()["call_1"]
+    closing = _details(amended).closing
+    assert closing is not None
+    assert closing.result == "{'total': 3}"
+    assert amended.content.endswith(
+        "Cell 1 completed after this output, before the response ended.\n\n"
+        "Output:\nlate\n\nResult:\n{'total': 3}\n\nStored: k."
     )
 
 
