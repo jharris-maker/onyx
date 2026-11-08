@@ -1,14 +1,16 @@
 """Prometheus metrics for code mode capacity in one API server process.
 
-The sandbox worker pool, the dumped-program budget and the tool call thread
-budget are per process. The gauges of these budgets each have a matching
-`_limit` gauge to compare against. Labels are closed enums; no tenant or user
-labels.
+The sandbox worker pool, the dumped-program budget, the tool call thread budget
+and the running cell budget are per process. The gauges of these budgets each
+have a matching `_limit` gauge to compare against. Labels are closed enums; no
+tenant or user labels.
 """
 
 from typing import Literal
 
 from prometheus_client import Counter, Gauge, Histogram
+
+from onyx.tools.tool_implementations.code_mode.models import ClosedStatus
 
 WorkerLossReason = Literal["crashed", "killed"]
 SuspensionOutcome = Literal["dumped", "over_budget"]
@@ -60,6 +62,42 @@ TOOL_CALL_THREADS_LIMIT = Gauge(
     "onyx_code_mode_tool_call_threads_limit",
     "Budget of threads for tool calls of programs.",
 )
+CELLS_RUNNING = Gauge(
+    "onyx_code_mode_cells_running",
+    "Cells whose program has not ended, each with a driver thread.",
+)
+CELLS_LIMIT = Gauge(
+    "onyx_code_mode_cells_limit",
+    "Cells whose program has not ended that the process allows.",
+)
+CELL_BUSY_REJECTIONS = Counter(
+    "onyx_code_mode_cell_busy_rejections_total",
+    "New cells refused because the process had its limit of running cells.",
+)
+PROGRAMS = Counter(
+    "onyx_code_mode_programs_total",
+    "Programs that ended, by status.",
+    ["status"],
+)
+PROGRAM_DURATION = Histogram(
+    "onyx_code_mode_program_duration_seconds",
+    "Time from a program's start to its end, waiting for tool calls included.",
+    buckets=(
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+        30.0,
+        60.0,
+        120.0,
+        300.0,
+        900.0,
+    ),
+)
 PROGRAM_START_DURATION = Histogram(
     "onyx_code_mode_program_start_duration_seconds",
     "Time to type-check a program and run it to its first wait or end.",
@@ -73,6 +111,11 @@ def set_code_mode_limits(
     SANDBOX_WORKERS_LIMIT.set(sandbox_workers)
     SUSPENDED_BYTES_LIMIT.set(suspended_bytes)
     TOOL_CALL_THREADS_LIMIT.set(tool_call_threads)
+
+
+def observe_program_end(status: ClosedStatus, duration_seconds: float) -> None:
+    PROGRAMS.labels(status=status).inc()
+    PROGRAM_DURATION.observe(duration_seconds)
 
 
 def count_worker_lost(reason: WorkerLossReason) -> None:

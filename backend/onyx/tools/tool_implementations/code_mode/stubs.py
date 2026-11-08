@@ -28,6 +28,7 @@ from onyx.tools.tool_implementations.code_mode.models import (
 from onyx.tools.tool_implementations.code_mode.sandbox import (
     SANDBOX_NAMES,
     YIELD_CONTROL_STUB,
+    HostFunction,
 )
 from onyx.tools.tool_implementations.code_mode.store import (
     STORE_FUNCTIONS,
@@ -35,6 +36,7 @@ from onyx.tools.tool_implementations.code_mode.store import (
     json_value,
 )
 from onyx.tools.tool_implementations.code_mode.tool_search import (
+    TOOL_SEARCH_FUNCTION,
     TOOL_SEARCH_NAMES,
     TOOL_SEARCH_STUBS,
     ToolIndex,
@@ -118,6 +120,33 @@ class ToolStubs(BaseModel):
     listed_text: str
     # tool_search() over the deferred functions; None when there are none.
     tool_index: ToolIndex | None
+
+    @property
+    def async_functions(self) -> dict[str, HostFunction]:
+        """Host functions that only some programs have; programs await them."""
+        if self.tool_index is None:
+            return {}
+        return {TOOL_SEARCH_FUNCTION: self.tool_index.tool_search}
+
+    @property
+    def deferred_namespaces(self) -> list[str]:
+        """The namespaces of the deferred functions, in name order."""
+        return sorted(
+            {
+                namespace
+                for function in self.functions.values()
+                if function.deferred
+                and (namespace := function.tool.code_mode_function_name.namespace)
+            }
+        )
+
+    @property
+    def has_deferred_functions_without_namespace(self) -> bool:
+        return any(
+            function.deferred
+            and function.tool.code_mode_function_name.namespace is None
+            for function in self.functions.values()
+        )
 
 
 def python_identifier(
