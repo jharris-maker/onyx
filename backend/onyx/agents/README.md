@@ -204,6 +204,7 @@ The run applies them and publishes `tool_result_amended` before `agent_end` and 
 A hook that fails or stops for cancellation is logged; the run keeps its outcome and recorded results.
 An amended result inside the compaction checkpoint drops the checkpoint, so the next request summarizes the new result.
 `on_suspend(results)` has the same contract; it runs when the run suspends, before the run captures its state.
+Chat code mode uses these hooks to stop open cells and save what they did, also for a call that Stop interrupted.
 
 Two optional tool callbacks cover interception and enrichment:
 
